@@ -13,36 +13,122 @@ def process_images_from_folder(folder_path):
             if img is None:
                 print(f"Skipping {filename}: could not read.")
                 continue
+
+# Helper functions for preprocessing steps
+def _resize_image(img, fx=2, fy=2, interpolation=cv2.INTER_LINEAR):
+    """Resizes the image."""
+    return cv2.resize(img, None, fx=fx, fy=fy, interpolation=interpolation)
+
+def _apply_gaussian_blur(img, kernel_size=(3, 3), sigma_x=0): # Kernel size default changed to (3,3)
+    """Applies Gaussian blur to the image."""
+    return cv2.GaussianBlur(img, kernel_size, sigma_x)
+
+def _apply_clahe(gray_img, clip_limit=2.0, tile_grid_size=(8, 8)): # Defaults are explicit
+    """Applies CLAHE to a grayscale image."""
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    return clahe.apply(gray_img)
+
+def _apply_adaptive_thresholding(gray_img, polarity, max_value=255, adaptive_method=cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 block_size=15, c_value=3): # block_size default to 15, c_value to 3
+    """Applies adaptive thresholding to a grayscale image, adjusting for polarity."""
+    if polarity == "dark_on_light":
+        threshold_type = cv2.THRESH_BINARY
+    elif polarity == "light_on_dark":
+        threshold_type = cv2.THRESH_BINARY_INV
+    else:
+        # Fallback or error, for now, let's use INV as it was the previous default
+        print(f"Warning: Unknown polarity '{polarity}', defaulting to THRESH_BINARY_INV")
+        threshold_type = cv2.THRESH_BINARY_INV
+        
+    return cv2.adaptiveThreshold(gray_img, max_value, adaptive_method,
+                                 threshold_type, block_size, c_value)
+
+def _apply_morphological_operations(binary_img, kernel_size=(3, 3), kernel_shape=cv2.MORPH_RECT, op_order=('open', 'close')):
+    """Applies morphological operations (e.g., opening then closing) to a binary image."""
+    kernel = cv2.getStructuringElement(kernel_shape, kernel_size)
+    processed_img = binary_img
+    for op in op_order:
+        if op == 'open':
+            processed_img = cv2.morphologyEx(processed_img, cv2.MORPH_OPEN, kernel)
+        elif op == 'close':
+            processed_img = cv2.morphologyEx(processed_img, cv2.MORPH_CLOSE, kernel)
+        # Can add more operations like 'erode', 'dilate' if needed
+    return processed_img
+
+def _detect_digit_polarity(grayscale_image):
+    """
+    Detects whether digits are light on a dark background or dark on a light background.
+    
+    Args:
+        grayscale_image: A NumPy array representing the grayscale image.
+        
+    Returns:
+        A string: "light_on_dark" or "dark_on_light".
+    """
+    # Apply Otsu's thresholding
+    _, otsu_binary_img = cv2.threshold(grayscale_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Calculate the mean intensity of the original grayscale image
+    mean_intensity_grayscale_image = cv2.mean(grayscale_image)[0]
+    
+    # Calculate the mean intensity of the grayscale image only in regions that are white (255) in otsu_binary_img
+    # These are the potential foreground regions according to Otsu.
+    # We need to handle the case where otsu_binary_img is all black (e.g., a completely black input image)
+    # to avoid division by zero in cv2.mean if the mask is empty.
+    if cv2.countNonZero(otsu_binary_img) > 0:
+        mean_intensity_otsu_foreground = cv2.mean(grayscale_image, mask=otsu_binary_img)[0]
+    else:
+        # If Otsu foreground is empty, we can't determine polarity this way.
+        # Fallback or default based on expectation. For now, let's assume dark_on_light as a default
+        # or handle it based on which mean is greater (effectively, if foreground is empty, its "mean" is 0).
+        # If mean_intensity_grayscale_image is also 0 (all black), then it doesn't matter.
+        # If mean_intensity_grayscale_image > 0, then mean_intensity_otsu_foreground (0) < mean_intensity_grayscale_image.
+        mean_intensity_otsu_foreground = 0 
+
+
+    if mean_intensity_otsu_foreground > mean_intensity_grayscale_image:
+        return "light_on_dark"
+    else:
+        return "dark_on_light"
+
 def preprocess_image(image_path):
     img = cv2.imread(image_path)
     if img is None:
         print(f"Error: could not read image at {image_path}")
         return None
 
+    # Ensure image is grayscale
+    if len(img.shape) == 3 and img.shape[2] == 3: # Check if it's a color image
+        gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    elif len(img.shape) == 2: # Already grayscale
+        gray_img = img
+    else: # Unexpected image format
+        print(f"Error: Unexpected image format for {image_path}. Shape: {img.shape}")
+        return None
+
     # 3.a. Image resizing (2x upscaling, linear interpolation)
-    img_resized = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+    img_resized = _resize_image(gray_img) # Apply to grayscale image
 
     # 3.b. Noise reduction (Gaussian blur)
-    img_blurred = cv2.GaussianBlur(img_resized, (5, 5), 0)
-
-    # 3.c. Convert to grayscale
-    gray_img = cv2.cvtColor(img_blurred, cv2.COLOR_BGR2GRAY)
+    img_blurred = _apply_gaussian_blur(img_resized)
 
     # 3.d. Adaptive histogram equalization (CLAHE)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    img_clahe = clahe.apply(gray_img)
+    # Note: Grayscale conversion is now done at the beginning.
+    # CLAHE is applied to the already blurred grayscale image.
+    img_clahe = _apply_clahe(img_blurred)
+
+    # Detect digit polarity
+    polarity = _detect_digit_polarity(img_clahe) # Use CLAHE output for polarity detection
+    print(f"Detected polarity for {image_path}: {polarity}")
 
     # 3.f. Adaptive thresholding for binarization
-    # Block size and C value might need tuning
-    binary_img = cv2.adaptiveThreshold(img_clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 11, 2)
+    # Adjust threshold_type in _apply_adaptive_thresholding based on polarity.
+    binary_img = _apply_adaptive_thresholding(img_clahe, polarity)
 
     # 3.g. Morphological operations (opening then closing)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    img_opened = cv2.morphologyEx(binary_img, cv2.MORPH_OPEN, kernel)
-    img_closed = cv2.morphologyEx(img_opened, cv2.MORPH_CLOSE, kernel)
+    img_processed = _apply_morphological_operations(binary_img)
     
-    return img_closed
+    return img_processed
 
 def extract_numeric_value(text_match):
     """
